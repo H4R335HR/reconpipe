@@ -1,4 +1,4 @@
-# recon
+# reconpipe
 
 Automated bug bounty recon pipeline. Chains subdomain enumeration, DNS resolution, HTTP probing, port scanning, URL discovery, and vulnerability scanning into a single command.
 
@@ -9,16 +9,16 @@ subfinder → dnsx → httpx + naabu → gau + katana + ffuf → nuclei
 ## Install
 
 ```bash
-cp recon.sh ~/.local/bin/recon
-chmod +x ~/.local/bin/recon
+cp reconpipe.sh ~/.local/bin/reconpipe
+chmod +x ~/.local/bin/reconpipe
 ```
 
 ## Usage
 
 ```bash
-recon -d target.com
-recon -d target.com -w /path/to/wordlist.txt
-recon -d target.com -p 500 -c 80 --skip-ffuf
+reconpipe -d target.com
+reconpipe -d target.com -w /path/to/wordlist.txt
+reconpipe -d target.com -p 500 -c 80 --skip-ffuf
 ```
 
 | Flag | Description | Default |
@@ -33,7 +33,7 @@ recon -d target.com -p 500 -c 80 --skip-ffuf
 
 ## Output
 
-All results saved to `./recon/<domain>/<timestamp>/`:
+All results saved to `./reconpipe/<domain>/<timestamp>/`:
 
 ```
 ├── subdomains/          # subfinder output

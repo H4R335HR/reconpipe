@@ -586,38 +586,91 @@ phase_nuclei() {
     info "Updating nuclei templates..."
     nuclei -update-templates 2>"$LOGS/nuclei_update.log" || true
 
-    # Run against alive hosts (web misconfigs, tech-specific CVEs)
-    info "Scanning alive hosts..."
+    # ─── Deduplicate URLs by path pattern ─────────────────────
+    # gau+katana can return 50k+ URLs where most are the same endpoint
+    # with different parameter values. Nuclei re-scans each one.
+    # Dedup by stripping param values → unique endpoint patterns only.
+
+    local raw_count deduped_count
+    raw_count=$(wc -l < "$URLS/all_urls.txt" 2>/dev/null || echo 0)
+
+    if command -v uro &>/dev/null; then
+        # uro is purpose-built for this — removes duplicate URL patterns
+        cat "$URLS/all_urls.txt" | uro > "$URLS/all_urls_deduped.txt" 2>/dev/null
+    else
+        # Fallback: keep one URL per unique path (strip query values)
+        awk -F'?' '{
+            path = $1
+            if (!seen[path]++) print
+        }' "$URLS/all_urls.txt" | sort -u > "$URLS/all_urls_deduped.txt"
+    fi
+
+    deduped_count=$(wc -l < "$URLS/all_urls_deduped.txt" 2>/dev/null || echo 0)
+    info "URL dedup: $raw_count → $deduped_count unique patterns ($(( raw_count - deduped_count )) duplicates removed)"
+
+    # ─── Scan 1: Alive hosts (misconfigs, tech-specific CVEs) ─
+    info "Scanning alive hosts ($(wc -l < "$HTTPX_DIR/alive_final.txt") targets)..."
     nuclei -l "$HTTPX_DIR/alive_final.txt" \
            -severity "$NUCLEI_SEVERITY" \
            -silent \
            -concurrency "$CONCURRENCY" \
+           -stats -stats-interval 30 \
            -o "$VULNS/nuclei_hosts.txt" \
            2>"$LOGS/nuclei_hosts_errors.log" || true
 
-    # Run against all discovered URLs (endpoint-specific vulns)
-    info "Scanning all discovered URLs..."
-    nuclei -l "$URLS/all_urls.txt" \
+    local hosts_found
+    hosts_found=$(wc -l < "$VULNS/nuclei_hosts.txt" 2>/dev/null || echo 0)
+    info "Host scan done — $hosts_found findings"
+
+    # ─── Scan 2: Deduped URLs (targeted templates only) ───────
+    # Full template set on a huge URL list is what causes the hang.
+    # Run only URL-relevant templates: CVEs, vulns, exposures, misconfigs.
+    info "Scanning $deduped_count deduplicated URLs (targeted templates)..."
+    nuclei -l "$URLS/all_urls_deduped.txt" \
+           -t http/cves/ \
+           -t http/vulnerabilities/ \
+           -t http/exposures/ \
+           -t http/misconfiguration/ \
            -severity "$NUCLEI_SEVERITY" \
            -silent \
            -concurrency "$CONCURRENCY" \
+           -stats -stats-interval 30 \
            -o "$VULNS/nuclei_urls.txt" \
            2>"$LOGS/nuclei_urls_errors.log" || true
 
-    # Run specifically against parameterized URLs (injection points)
+    local urls_found
+    urls_found=$(wc -l < "$VULNS/nuclei_urls.txt" 2>/dev/null || echo 0)
+    info "URL scan done — $urls_found findings"
+
+    # ─── Scan 3: Parameterized URLs (injection-focused) ───────
     if [[ -s "$URLS/parameterized_urls.txt" ]]; then
-        info "Scanning parameterized URLs (injection candidates)..."
-        nuclei -l "$URLS/parameterized_urls.txt" \
+        local param_count
+        param_count=$(wc -l < "$URLS/parameterized_urls.txt")
+
+        # Dedup parameterized URLs too
+        if command -v uro &>/dev/null; then
+            cat "$URLS/parameterized_urls.txt" | uro > "$URLS/parameterized_deduped.txt" 2>/dev/null
+        else
+            awk -F'?' '{path=$1; if (!seen[path]++) print}' \
+                "$URLS/parameterized_urls.txt" | sort -u > "$URLS/parameterized_deduped.txt"
+        fi
+
+        local param_deduped
+        param_deduped=$(wc -l < "$URLS/parameterized_deduped.txt" 2>/dev/null || echo 0)
+        info "Scanning $param_deduped parameterized URLs (from $param_count, injection candidates)..."
+
+        nuclei -l "$URLS/parameterized_deduped.txt" \
                -t http/vulnerabilities/ \
                -t http/cves/ \
                -severity "$NUCLEI_SEVERITY" \
                -silent \
                -concurrency "$CONCURRENCY" \
+               -stats -stats-interval 30 \
                -o "$VULNS/nuclei_params.txt" \
                2>"$LOGS/nuclei_params_errors.log" || true
     fi
 
-    # Run CNAME-based checks for subdomain takeovers
+    # ─── Scan 4: CNAME subdomain takeover ─────────────────────
     if [[ -s "$DNS/cnames.txt" ]]; then
         info "Checking CNAMEs for subdomain takeover..."
         awk '{print $1}' "$DNS/cnames.txt" | \
@@ -627,7 +680,7 @@ phase_nuclei() {
                2>"$LOGS/nuclei_takeover_errors.log" || true
     fi
 
-    # Merge all nuclei findings
+    # ─── Merge all findings ───────────────────────────────────
     cat "$VULNS"/nuclei_*.txt 2>/dev/null | sort -u > "$VULNS/all_findings.txt"
 
     local findings

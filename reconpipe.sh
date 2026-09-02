@@ -78,6 +78,7 @@ FFUF_THREADS=40
 NUCLEI_SEVERITY="low,medium,high,critical"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 SKIP_FFUF=false
+RESUME=false
 
 # ─── Argument Parsing ─────────────────────────────────────────
 
@@ -95,6 +96,7 @@ Optional:
   -k <depth>          Katana crawl depth (default: 3)
   -s <severity>       Nuclei severity filter (default: low,medium,high,critical)
   --skip-ffuf         Skip ffuf directory brute-forcing
+  --resume            Resume the most recent incomplete run for this domain
   -h                  Show this help
 EOF
     exit 1
@@ -109,6 +111,7 @@ while [[ $# -gt 0 ]]; do
         -k) KATANA_DEPTH="$2"; shift 2 ;;
         -s) NUCLEI_SEVERITY="$2"; shift 2 ;;
         --skip-ffuf) SKIP_FFUF=true; shift ;;
+        --resume) RESUME=true; shift ;;
         -h|--help) usage ;;
         *) error "Unknown option: $1"; usage ;;
     esac
@@ -118,7 +121,26 @@ done
 
 # ─── Output Directory Structure ───────────────────────────────
 
-BASE_DIR="./reconpipe/${DOMAIN}/${TIMESTAMP}"
+if [[ "$RESUME" == true ]]; then
+    # Find the most recent run for this domain that didn't finish
+    LATEST=$(find "./reconpipe/${DOMAIN}" -maxdepth 1 -mindepth 1 -type d 2>/dev/null \
+        | sort -r | head -1)
+    if [[ -n "$LATEST" && ! -f "$LATEST/.done" ]]; then
+        BASE_DIR="$LATEST"
+        info "Resuming incomplete run: $BASE_DIR"
+    elif [[ -n "$LATEST" && -f "$LATEST/.done" ]]; then
+        warn "Last run already completed. Starting fresh."
+        RESUME=false
+        BASE_DIR="./reconpipe/${DOMAIN}/${TIMESTAMP}"
+    else
+        warn "No previous run found for ${DOMAIN}. Starting fresh."
+        RESUME=false
+        BASE_DIR="./reconpipe/${DOMAIN}/${TIMESTAMP}"
+    fi
+else
+    BASE_DIR="./reconpipe/${DOMAIN}/${TIMESTAMP}"
+fi
+
 mkdir -p "$BASE_DIR"/{subdomains,dns,httpx,ports,urls,fuzzing,vulnerabilities,screenshots,logs}
 
 LOGFILE="$BASE_DIR/logs/reconpipe.log"
@@ -133,6 +155,18 @@ URLS="$BASE_DIR/urls"
 FUZZ="$BASE_DIR/fuzzing"
 VULNS="$BASE_DIR/vulnerabilities"
 LOGS="$BASE_DIR/logs"
+
+# ─── Checkpoint Helpers ───────────────────────────────────────
+# Each phase marks itself done. On resume, completed phases are skipped.
+
+phase_done()    { touch "$BASE_DIR/.phase_${1}_done"; }
+phase_check()   {
+    if [[ -f "$BASE_DIR/.phase_${1}_done" ]]; then
+        info "Phase '$1' already complete — skipping"
+        return 0
+    fi
+    return 1
+}
 
 # ─── Dependency Check ─────────────────────────────────────────
 
@@ -225,6 +259,7 @@ dedup_append() {
 # ─── Phase 1: Subdomain Enumeration ──────────────────────────
 
 phase_subdomains() {
+    phase_check "subdomains" && return 0
     section "Phase 1 — Subdomain Enumeration (subfinder)"
     local start=$SECONDS
 
@@ -237,11 +272,13 @@ phase_subdomains() {
     count=$(wc -l < "$SUBS/all_subdomains.txt")
     info "Found $count unique subdomains in $(elapsed $((SECONDS - start)))"
     info "Output → $SUBS/all_subdomains.txt"
+    phase_done "subdomains"
 }
 
 # ─── Phase 2: DNS Resolution ─────────────────────────────────
 
 phase_dns() {
+    phase_check "dns" && return 0
     section "Phase 2 — DNS Resolution (dnsx)"
     local start=$SECONDS
 
@@ -268,11 +305,13 @@ phase_dns() {
     info "Resolved $resolved hosts (from $(wc -l < "$SUBS/all_subdomains.txt") subdomains)"
     info "Found $cnames CNAME records (check for subdomain takeover)"
     info "Output → $DNS/resolved_hosts.txt"
+    phase_done "dns"
 }
 
 # ─── Phase 3: HTTP Probing (Standard Ports) ───────────────────
 
 phase_httpx_standard() {
+    phase_check "httpx_standard" && return 0
     section "Phase 3a — HTTP Probing, Standard Ports (httpx)"
     local start=$SECONDS
 
@@ -293,11 +332,13 @@ phase_httpx_standard() {
     count=$(wc -l < "$HTTPX_DIR/alive_standard_urls.txt")
     info "Found $count live hosts on standard ports in $(elapsed $((SECONDS - start)))"
     info "Output → $HTTPX_DIR/alive_standard_urls.txt"
+    phase_done "httpx_standard"
 }
 
 # ─── Phase 4: Port Scanning ──────────────────────────────────
 
 phase_naabu() {
+    phase_check "naabu" && return 0
     section "Phase 3b — Port Scanning (naabu)"
     local start=$SECONDS
 
@@ -312,11 +353,13 @@ phase_naabu() {
     open=$(wc -l < "$PORTS/naabu_raw.txt")
     info "Found $open open host:port pairs in $(elapsed $((SECONDS - start)))"
     info "Output → $PORTS/naabu_raw.txt"
+    phase_done "naabu"
 }
 
 # ─── Phase 5: HTTP Probing on All Discovered Ports ────────────
 
 phase_httpx_allports() {
+    phase_check "httpx_allports" && return 0
     section "Phase 3c — HTTP Probing, All Ports (httpx on naabu output)"
     local start=$SECONDS
 
@@ -358,11 +401,13 @@ phase_httpx_allports() {
     info "Standard ports: $standard | All ports: $allports | Merged (deduped): $merged"
     info "Extra targets from non-standard ports: $((merged - standard))"
     info "Master alive list → $HTTPX_DIR/alive_final.txt"
+    phase_done "httpx_allports"
 }
 
 # ─── Phase 6: Passive URL Collection ─────────────────────────
 
 phase_gau() {
+    phase_check "gau" && return 0
     section "Phase 4a — Passive URL Collection (gau)"
     local start=$SECONDS
 
@@ -388,11 +433,13 @@ phase_gau() {
     count=$(wc -l < "$URLS/gau_urls.txt" 2>/dev/null || echo 0)
     info "Collected $count historical URLs in $(elapsed $((SECONDS - start)))"
     info "Output → $URLS/gau_urls.txt"
+    phase_done "gau"
 }
 
 # ─── Phase 7: Active Crawling ────────────────────────────────
 
 phase_katana() {
+    phase_check "katana" && return 0
     section "Phase 4b — Active Crawling (katana)"
     local start=$SECONDS
 
@@ -410,6 +457,7 @@ phase_katana() {
     count=$(wc -l < "$URLS/katana_urls.txt")
     info "Crawled $count URLs in $(elapsed $((SECONDS - start)))"
     info "Output → $URLS/katana_urls.txt"
+    phase_done "katana"
 }
 
 # ─── Phase 8: Directory Brute-Forcing ─────────────────────────
@@ -419,6 +467,7 @@ phase_ffuf() {
         warn "Skipping ffuf (--skip-ffuf or no wordlist found)"
         return 0
     fi
+    phase_check "ffuf" && return 0
 
     section "Phase 4c — Directory Brute-Forcing (ffuf)"
     local start=$SECONDS
@@ -455,11 +504,13 @@ phase_ffuf() {
     count=$(wc -l < "$FUZZ/ffuf_all_urls.txt" 2>/dev/null || echo 0)
     info "ffuf discovered $count unique URLs in $(elapsed $((SECONDS - start)))"
     info "Output → $FUZZ/ffuf_all_urls.txt"
+    phase_done "ffuf"
 }
 
 # ─── Phase 9: Merge All URLs ─────────────────────────────────
 
 phase_merge_urls() {
+    phase_check "merge_urls" && return 0
     section "Merging All Discovered URLs"
 
     cat "$URLS/gau_urls.txt" \
@@ -486,6 +537,7 @@ phase_merge_urls() {
     info "  Dynamic endpoints: $dynamic"
     info "  Parameterized URLs: $params"
     info "Master URL list → $URLS/all_urls.txt"
+    phase_done "merge_urls"
 }
 
 # ─── Phase 10: Screenshots (Optional) ────────────────────────
@@ -495,6 +547,7 @@ phase_screenshots() {
         warn "gowitness not found — skipping screenshots"
         return 0
     fi
+    phase_check "screenshots" && return 0
 
     section "Phase 5 — Visual Recon (gowitness)"
     local start=$SECONDS
@@ -520,11 +573,13 @@ phase_screenshots() {
     count=$(find "$BASE_DIR/screenshots" -type f \( -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" \) 2>/dev/null | wc -l)
     info "Captured $count screenshots in $(elapsed $((SECONDS - start)))"
     info "Output → $BASE_DIR/screenshots/"
+    phase_done "screenshots"
 }
 
 # ─── Phase 11: Vulnerability Scanning ─────────────────────────
 
 phase_nuclei() {
+    phase_check "nuclei" && return 0
     section "Phase 6 — Vulnerability Scanning (nuclei)"
     local start=$SECONDS
 
@@ -579,6 +634,7 @@ phase_nuclei() {
     findings=$(wc -l < "$VULNS/all_findings.txt" 2>/dev/null || echo 0)
     info "Total unique findings: $findings in $(elapsed $((SECONDS - start)))"
     info "Output → $VULNS/all_findings.txt"
+    phase_done "nuclei"
 }
 
 # ─── Summary Report ───────────────────────────────────────────
@@ -703,6 +759,7 @@ main() {
     send_notification
 
     section "Done"
+    touch "$BASE_DIR/.done"
     info "Total time: $(elapsed $((SECONDS - GLOBAL_START)))"
     info "All outputs: ${BASE_DIR}/"
     info "Report: ${BASE_DIR}/REPORT.md"

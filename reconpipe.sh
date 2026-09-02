@@ -79,6 +79,8 @@ NUCLEI_SEVERITY="low,medium,high,critical"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 SKIP_FFUF=false
 RESUME=false
+NUCLEI_URLS=false
+NUCLEI_PARAMS=false
 
 # ─── Argument Parsing ─────────────────────────────────────────
 
@@ -96,6 +98,9 @@ Optional:
   -k <depth>          Katana crawl depth (default: 3)
   -s <severity>       Nuclei severity filter (default: low,medium,high,critical)
   --skip-ffuf         Skip ffuf directory brute-forcing
+  --nuclei-urls       Also scan all discovered URLs with nuclei (slow)
+  --nuclei-params     Also scan parameterized URLs with nuclei (slow)
+  --nuclei-full       Enable both --nuclei-urls and --nuclei-params
   --resume            Resume the most recent incomplete run for this domain
   -h                  Show this help
 EOF
@@ -111,6 +116,9 @@ while [[ $# -gt 0 ]]; do
         -k) KATANA_DEPTH="$2"; shift 2 ;;
         -s) NUCLEI_SEVERITY="$2"; shift 2 ;;
         --skip-ffuf) SKIP_FFUF=true; shift ;;
+        --nuclei-urls) NUCLEI_URLS=true; shift ;;
+        --nuclei-params) NUCLEI_PARAMS=true; shift ;;
+        --nuclei-full) NUCLEI_URLS=true; NUCLEI_PARAMS=true; shift ;;
         --resume) RESUME=true; shift ;;
         -h|--help) usage ;;
         *) error "Unknown option: $1"; usage ;;
@@ -623,27 +631,29 @@ phase_nuclei() {
     info "Host scan done — $hosts_found findings"
 
     # ─── Scan 2: Deduped URLs (targeted templates only) ───────
-    # Full template set on a huge URL list is what causes the hang.
-    # Run only URL-relevant templates: CVEs, vulns, exposures, misconfigs.
-    info "Scanning $deduped_count deduplicated URLs (targeted templates)..."
-    nuclei -l "$URLS/all_urls_deduped.txt" \
-           -t http/cves/ \
-           -t http/vulnerabilities/ \
-           -t http/exposures/ \
-           -t http/misconfiguration/ \
-           -severity "$NUCLEI_SEVERITY" \
-           -silent \
-           -concurrency "$CONCURRENCY" \
-           -stats -stats-interval 30 \
-           -o "$VULNS/nuclei_urls.txt" \
-           2>"$LOGS/nuclei_urls_errors.log" || true
+    if [[ "$NUCLEI_URLS" == true ]]; then
+        info "Scanning $deduped_count deduplicated URLs (targeted templates)..."
+        nuclei -l "$URLS/all_urls_deduped.txt" \
+               -t http/cves/ \
+               -t http/vulnerabilities/ \
+               -t http/exposures/ \
+               -t http/misconfiguration/ \
+               -severity "$NUCLEI_SEVERITY" \
+               -silent \
+               -concurrency "$CONCURRENCY" \
+               -stats -stats-interval 30 \
+               -o "$VULNS/nuclei_urls.txt" \
+               2>"$LOGS/nuclei_urls_errors.log" || true
 
-    local urls_found
-    urls_found=$(wc -l < "$VULNS/nuclei_urls.txt" 2>/dev/null || echo 0)
-    info "URL scan done — $urls_found findings"
+        local urls_found
+        urls_found=$(wc -l < "$VULNS/nuclei_urls.txt" 2>/dev/null || echo 0)
+        info "URL scan done — $urls_found findings"
+    else
+        warn "Skipping URL scan (use --nuclei-urls or --nuclei-full to enable)"
+    fi
 
     # ─── Scan 3: Parameterized URLs (injection-focused) ───────
-    if [[ -s "$URLS/parameterized_urls.txt" ]]; then
+    if [[ "$NUCLEI_PARAMS" == true && -s "$URLS/parameterized_urls.txt" ]]; then
         local param_count
         param_count=$(wc -l < "$URLS/parameterized_urls.txt")
 
@@ -668,6 +678,8 @@ phase_nuclei() {
                -stats -stats-interval 30 \
                -o "$VULNS/nuclei_params.txt" \
                2>"$LOGS/nuclei_params_errors.log" || true
+    elif [[ "$NUCLEI_PARAMS" == false ]]; then
+        warn "Skipping parameterized URL scan (use --nuclei-params or --nuclei-full to enable)"
     fi
 
     # ─── Scan 4: CNAME subdomain takeover ─────────────────────

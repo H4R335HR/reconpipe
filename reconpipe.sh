@@ -418,21 +418,50 @@ phase_gau() {
     phase_check "gau" && return 0
     section "Phase 4a — Passive URL Collection (gau)"
     local start=$SECONDS
+    local gau_timeout=300   # 5 minute timeout for gau
 
-    # Feed domains (not full URLs) to gau
+    # Build domain list for gau
     sed 's|https\?://||;s|/.*||' "$HTTPX_DIR/alive_final.txt" \
-        | sort -u \
-        | gau --threads 5 \
-              --subs \
-              --o "$URLS/gau_raw.txt" \
-              2>"$LOGS/gau_errors.log" || true
+        | sort -u > "$URLS/gau_domains.txt"
 
-    # If gau didn't use --o properly, handle piped output
+    local domain_count
+    domain_count=$(wc -l < "$URLS/gau_domains.txt")
+    info "Querying $domain_count domains from web archives (timeout: ${gau_timeout}s)..."
+
+    # Background progress reporter — prints URL count every 15s
+    (
+        while true; do
+            sleep 15
+            if [[ -f "$URLS/gau_raw.txt" ]]; then
+                local c
+                c=$(wc -l < "$URLS/gau_raw.txt" 2>/dev/null || echo 0)
+                echo -e "${YELLOW}[!]${RESET} gau progress: $c URLs collected so far... ($(elapsed $((SECONDS - start))))"
+            fi
+        done
+    ) &
+    local progress_pid=$!
+
+    # Run gau with timeout, increased threads, and explicit output file
+    timeout "${gau_timeout}" bash -c '
+        cat "'"$URLS/gau_domains.txt"'" \
+            | gau --threads 5 \
+                  --subs \
+                  --timeout 30 \
+                  --o "'"$URLS/gau_raw.txt"'" \
+                  2>"'"$LOGS/gau_errors.log"'"
+    ' || true
+
+    # Kill the progress reporter
+    kill "$progress_pid" 2>/dev/null; wait "$progress_pid" 2>/dev/null || true
+
+    # Fallback: if --o didn't write (some gau versions), try stdout redirect
     [[ ! -s "$URLS/gau_raw.txt" ]] && {
-        sed 's|https\?://||;s|/.*||' "$HTTPX_DIR/alive_final.txt" \
-            | sort -u \
-            | gau --threads 5 --subs \
-            > "$URLS/gau_raw.txt" 2>"$LOGS/gau_errors.log" || true
+        info "Retrying gau with stdout redirect..."
+        timeout "${gau_timeout}" bash -c '
+            cat "'"$URLS/gau_domains.txt"'" \
+                | gau --threads 5 --subs --timeout 30 \
+                > "'"$URLS/gau_raw.txt"'" 2>"'"$LOGS/gau_errors.log"'"
+        ' || true
     }
 
     sort -u "$URLS/gau_raw.txt" -o "$URLS/gau_urls.txt" 2>/dev/null || true
@@ -560,13 +589,14 @@ phase_screenshots() {
     section "Phase 5 — Visual Recon (gowitness)"
     local start=$SECONDS
 
-    # gowitness v3+ changed its CLI; detect and adapt
-    if gowitness scan --help 2>&1 | grep -q "single"; then
-        # v3+: gowitness scan -f file --screenshot-path dir
-        gowitness scan \
+    # gowitness v3 CLI: gowitness scan file -f <file>
+    # v3 uses subcommands under "scan" (file, single, nmap, nessus, ...)
+    if gowitness scan file --help &>/dev/null; then
+        # v3+: gowitness scan file -f <file> -s <screenshot-path>
+        gowitness scan file \
             -f "$HTTPX_DIR/alive_final.txt" \
-            --screenshot-path "$BASE_DIR/screenshots" \
-            --threads 10 \
+            -s "$BASE_DIR/screenshots" \
+            -t 10 \
             2>"$LOGS/gowitness_errors.log" || true
     else
         # v2: gowitness file -f file -P dir

@@ -1,0 +1,4 @@
+# Always use LF for shell scripts regardless of the platform committing them
+*.sh    text eol=lf
+*.md    text eol=lf
+LICENSE text eol=lf
